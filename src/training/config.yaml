@@ -1,0 +1,60 @@
+base: &base 
+  seed: 42
+  output_dir: "checkpoints/poc"
+  num_epochs: 2
+  per_device_train_batch_size: 64
+  per_device_eval_batch_size: 64
+  learning_rate: 5e-4
+  weight_decay: 0.0
+  bf16: true
+  log_every: 25
+  eval_every: 1
+  grad_accum_steps: 1
+
+data:
+  dataset: "cifar10"
+  image_size: 224 # if using ViT-B/16 preprocess
+  text_from_labels: true # captions like "a photo of a {label}"
+  train_split: "train[:90%]"
+  val_split:   "train[90%:]"
+  test_split:  "test"
+
+encoders:
+  text:
+    tokenizer_name: "ai21labs/Jamba-v0.1" # tokenizer only
+    hidden_size: 2048 # interface dim to fusion
+    frozen: true
+    stub: true # use lightweight frozen stub
+  image:
+    name: "vit_b_16" # torchvision ViT-B/16
+    pretrained: true
+    frozen: true
+    proj_out: 2048
+
+fusion:
+  type: "concat_proj" # concat([txt, img]) -> proj to MoE dim
+  hidden_size: 2048
+
+moe:
+  num_layers: 1
+  model_dim: 2048
+  ffn_dim: 4096
+  activation: "swiglu"
+  num_experts: 4
+  top_k: 2
+  capacity_factor: 1.25
+  router_aux_loss_weight: 0.01
+
+ablation_small:
+  <<: *base  # Now this will work
+  output_dir: "checkpoints/ablation_small"
+  moe:
+    num_layers: 1
+    num_experts: 2
+
+ablation_wide:
+  <<: *base  # Now this will work
+  output_dir: "checkpoints/ablation_wide"
+  moe:
+    num_layers: 2
+    num_experts: 8

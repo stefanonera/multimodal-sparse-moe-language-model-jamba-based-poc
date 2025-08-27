@@ -1,0 +1,8 @@
+.venv/
+checkpoints/
+.vscode/
+data/
+*.csv
+*.json
+*.pkl
+__pycache__/
