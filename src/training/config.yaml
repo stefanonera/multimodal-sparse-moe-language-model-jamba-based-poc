@@ -1,59 +1,70 @@
-base: &base 
+base: &base
   seed: 42
+  task: "image_text_cifar10" # options: image_text_cifar10, text_agnews, video_folder
   output_dir: "checkpoints/poc"
-  num_epochs: 2
+  num_epochs: 10
   per_device_train_batch_size: 64
   per_device_eval_batch_size: 64
-  learning_rate: 5e-4
-  weight_decay: 0.0
+  learning_rate: 1e-4
+  weight_decay: 0.01
   bf16: true
   log_every: 25
-  eval_every: 1
-  grad_accum_steps: 1
+  grad_accum_steps: 4
 
 data:
-  dataset: "cifar10"
-  image_size: 224 # if using ViT-B/16 preprocess
-  text_from_labels: true # captions like "a photo of a {label}"
-  train_split: "train[:90%]"
-  val_split:   "train[90%:]"
-  test_split:  "test"
+  image:
+    image_size: 224
+    train_split: "train[:90%]"
+    val_split:   "train[90%:]"
+  text:
+    dataset_name: "ag_news" # small, quick
+    train_split: "train[:2000]"
+    val_split:   "test[:1000]"
+    max_length: 192
+  video:
+    root: "data/mini_ucf" # path to folder with video files
+    image_size: 224
+    num_frames: 12
+    max_text_len: 16
+    batch_size_train: 2
+    batch_size_eval: 4
 
 encoders:
   text:
-    tokenizer_name: "ai21labs/Jamba-v0.1" # tokenizer only
-    hidden_size: 2048 # interface dim to fusion
+    tokenizer_name: "ai21labs/Jamba-v0.1"
+    hidden_size: 1536
     frozen: true
-    stub: true # use lightweight frozen stub
+    stub: true
   image:
-    name: "vit_b_16" # torchvision ViT-B/16
-    pretrained: true
+    proj_out: 1536
     frozen: true
-    proj_out: 2048
+  video:
+    proj_out: 1536 
+    frozen: true
 
 fusion:
-  type: "concat_proj" # concat([txt, img]) -> proj to MoE dim
-  hidden_size: 2048
+  hidden_size: 1536
 
 moe:
-  num_layers: 1
-  model_dim: 2048
+  num_layers: 2
+  model_dim: 1024
   ffn_dim: 4096
   activation: "swiglu"
   num_experts: 4
   top_k: 2
-  capacity_factor: 1.25
-  router_aux_loss_weight: 0.01
+  capacity_factor: 2.0
+  router_aux_loss_weight: 0.03
 
+# tiny ablations
 ablation_small:
-  <<: *base  # Now this will work
+  <<: *base
   output_dir: "checkpoints/ablation_small"
   moe:
     num_layers: 1
     num_experts: 2
 
 ablation_wide:
-  <<: *base  # Now this will work
+  <<: *base
   output_dir: "checkpoints/ablation_wide"
   moe:
     num_layers: 2

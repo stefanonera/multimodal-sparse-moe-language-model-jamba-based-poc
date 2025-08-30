@@ -19,15 +19,14 @@ class TextClassificationDataset(Dataset):
         self.ds = load_dataset(dataset_name, split=split)
         self.text_field = text_field
         self.label_field = label_field
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name, use_fast=True, legacy=False
+        )
         self.max_length = max_length
-
-        # infer num_classes from features when available
-        if hasattr(self.ds, "features") and label_field in self.ds.features:
-            feat = self.ds.features[label_field]
-            self.num_classes = len(getattr(feat, "names", [])) or None
-        else:
-            self.num_classes = None
+        feat = self.ds.features[label_field]
+        self.num_classes = len(getattr(feat, "names", [])) or int(
+            self.ds.unique(label_field)
+        )
 
     def __len__(self):
         return len(self.ds)
@@ -66,7 +65,7 @@ def build_text_dataloaders(
     val_split: str = "test[:1000]",
     max_length: int = 128,
     num_workers: int = 2,
-) -> Tuple[DataLoader, DataLoader]:
+) -> Tuple[DataLoader, DataLoader, int]:
     train_ds = TextClassificationDataset(
         dataset_name=dataset_name,
         split=train_split,
@@ -79,7 +78,6 @@ def build_text_dataloaders(
         tokenizer_name=tokenizer_name,
         max_length=max_length,
     )
-
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size_train,
@@ -96,4 +94,4 @@ def build_text_dataloaders(
         pin_memory=True,
         collate_fn=text_collate_fn,
     )
-    return train_loader, val_loader
+    return train_loader, val_loader, train_ds.num_classes

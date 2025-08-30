@@ -7,7 +7,6 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 from torchvision.io import read_video
 from transformers import AutoTokenizer
-from PIL import Image
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -29,7 +28,6 @@ class VideoFolderDataset(Dataset):
         self.class_to_idx = {}
         self.idx_to_class = []
 
-        # scan folders
         classes = sorted([d.name for d in self.root.iterdir() if d.is_dir()])
         for idx, cname in enumerate(classes):
             self.class_to_idx[cname] = idx
@@ -41,8 +39,11 @@ class VideoFolderDataset(Dataset):
         if not self.samples:
             raise FileNotFoundError(f"No video files found under {self.root}")
 
+        self.num_classes = len(self.idx_to_class)
         self.num_frames = num_frames
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name, use_fast=True, legacy=False
+        )
         self.max_text_len = max_text_len
 
         self.tf = T.Compose(
@@ -63,57 +64,47 @@ class VideoFolderDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         path, y = self.samples[idx]
-        # read_video returns (video[T,H,W,C], audio, info)
-        video, _, info = read_video(str(path), pts_unit="sec")
-        # video: int tensor [T, H, W, C] in 0..255
+        video, _, _ = read_video(str(path), pts_unit="sec")
         T_total = video.shape[0]
         if T_total == 0:
             raise RuntimeError(f"Empty video: {path}")
 
-        # uniformly sample self.num_frames indices
         if self.num_frames == 1:
             frame_idxs = [T_total // 2]
         else:
             frame_idxs = torch.linspace(0, T_total - 1, self.num_frames).long().tolist()
 
-        frames = video[frame_idxs]  # [F, H, W, C]
-        frames = frames.permute(0, 3, 1, 2).float() / 255.0  # [F, C, H, W]
-        frames = torch.stack([self.tf(f) for f in frames], dim=0)  # [F, C, H, W]
+        frames = video[frame_idxs].permute(0, 3, 1, 2).float() / 255.0  # [F,3,H,W]
+        frames = torch.stack([self.tf(f) for f in frames], dim=0)  # [F,3,H,W]
 
-        caption = self._caption_from_label(y)
         toks = self.tokenizer(
-            caption,
+            self._caption_from_label(y),
             truncation=True,
             padding="max_length",
             max_length=self.max_text_len,
             return_tensors="pt",
         )
-        input_ids = toks["input_ids"].squeeze(0)
-        attn = toks["attention_mask"].squeeze(0)
-
         return {
-            "video_frames": frames,  # [F, 3, H, W]
-            "input_ids": input_ids,  # [T]
-            "attention_mask": attn,  # [T]
-            "label": torch.tensor(y, dtype=torch.long),
+            "video_frames": frames,  # [F,3,H,W]
+            "input_ids": toks["input_ids"].squeeze(0),
+            "attention_mask": toks["attention_mask"].squeeze(0),
+            "labels": torch.tensor(y, dtype=torch.long),
         }
 
 
 def video_collate_fn(batch):
-    # pad/truncate frames to consistent length within batch if needed
     max_f = max(b["video_frames"].shape[0] for b in batch)
     B = len(batch)
     C, H, W = batch[0]["video_frames"].shape[1:]
     frames = torch.zeros(B, max_f, C, H, W, dtype=batch[0]["video_frames"].dtype)
     for i, b in enumerate(batch):
-        f = b["video_frames"]
-        F = f.shape[0]
-        frames[i, :F] = f
+        F = b["video_frames"].shape[0]
+        frames[i, :F] = b["video_frames"]
     input_ids = torch.stack([b["input_ids"] for b in batch], dim=0)
     attention_mask = torch.stack([b["attention_mask"] for b in batch], dim=0)
-    labels = torch.stack([b["label"] for b in batch], dim=0)
+    labels = torch.stack([b["labels"] for b in batch], dim=0)
     return {
-        "video_frames": frames,  # [B, F, 3, H, W]
+        "video_frames": frames,
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "labels": labels,
@@ -161,3 +152,9 @@ def build_video_dataloaders(
         collate_fn=video_collate_fn,
     )
     return train_loader, val_loader
+
+
+def count_video_classes(root: str) -> int:
+    train_root = Path(root) / "train"
+    classes = [d.name for d in train_root.iterdir() if d.is_dir()]
+    return len(classes)

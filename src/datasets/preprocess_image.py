@@ -1,13 +1,15 @@
 from typing import Dict, Tuple
 import torch
 from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as T
 from datasets import load_dataset
 from PIL import Image
 from torchvision import transforms
 from transformers import AutoTokenizer
+import random
 
-CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
-CIFAR10_STD = (0.2470, 0.2435, 0.2616)
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 class CIFAR10WithCaptions(Dataset):
@@ -22,30 +24,42 @@ class CIFAR10WithCaptions(Dataset):
         super().__init__()
         self.ds = load_dataset("cifar10", split=split)
         self.label_names = self.ds.features["label"].names
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_name, use_fast=True, legacy=False
+        )
         self.text_from_labels = text_from_labels
         self.max_text_len = max_text_len
 
-        self.tf = transforms.Compose(
+        self.tf = T.Compose(
             [
-                # transforms.ToPILImage(),
-                transforms.Resize(image_size, interpolation=Image.BICUBIC),
-                transforms.CenterCrop(image_size),
-                transforms.ToTensor(),
-                transforms.Normalize(CIFAR10_MEAN, CIFAR10_STD),
+                T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC),
+                T.CenterCrop(image_size),
+                T.ToTensor(),  # convert PIL to tensor and normalize to [0,1]
+                T.Normalize(IMAGENET_MEAN, IMAGENET_STD),
             ]
         )
+
+        # add variety to captions to prevent overfitting
+        self.caption_templates = [
+            "a photo of a {name}",
+            "an image showing a {name}",
+            "this is a {name}",
+            "a picture of a {name}",
+            "a {name} in the image",
+        ]
 
     def __len__(self):
         return len(self.ds)
 
     def _caption_from_label(self, y: int) -> str:
         name = self.label_names[y]
-        return f"a photo of a {name}"
+        # add some variety to prevent the model from memorizing exact patterns
+        template = random.choice(self.caption_templates)
+        return template.format(name=name)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         item = self.ds[idx]
-        img = item["img"]  # numpy array HxWxC
+        img = item["img"]  # PIL Image
         y = int(item["label"])
 
         pixel_values = self.tf(img)

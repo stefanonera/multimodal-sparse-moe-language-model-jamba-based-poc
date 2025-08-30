@@ -80,8 +80,16 @@ class Top2Router(nn.Module):
         # primary and secondary routes
         for t in range(B):
             for k, e_idx, w in [
-                (0, int(e1[t]), float(w1[t])),
-                (1, int(e2[t]), float(w2[t])),
+                (
+                    0,
+                    int(e1[t].item()),
+                    w1[t],
+                ),  # Use .item() for index, keep tensor for weight
+                (
+                    1,
+                    int(e2[t].item()),
+                    w2[t],
+                ),  # Use .item() for index, keep tensor for weight
             ]:
                 expert_inputs[e_idx].append(x[t].unsqueeze(0))
                 expert_weights[e_idx].append(w)
@@ -97,7 +105,9 @@ class Top2Router(nn.Module):
             if len(expert_inputs[e]) == 0:
                 continue
             X_e = torch.cat(expert_inputs[e], dim=0)  # [N_e, D]
-            W_e = torch.tensor(expert_weights[e], device=device)  # [N_e]
+            W_e = torch.stack(
+                expert_weights[e]
+            )  # [N_e] - stack tensors instead of converting to tensor
             T_e = torch.tensor(expert_token_idx[e], device=device, dtype=torch.long)
 
             # sort by weight
@@ -120,9 +130,13 @@ class Top2Router(nn.Module):
             kept_mask[T_keep, e] = True
 
         counts_per_expert = kept_mask.sum(dim=0)  # [E]
-        balance_score = self._balance_score(probs).item()
+        balance_score = (
+            self._balance_score(probs).detach().item()
+        )  # Add .detach() before .item()
         topk_dist = gate_weights / (gate_weights.sum(dim=-1, keepdim=True) + 1e-9)
-        topk_ent = entropy(topk_dist, dim=-1).mean().item()
+        topk_ent = (
+            entropy(topk_dist, dim=-1).mean().detach().item()
+        )  # Add .detach() before .item()
 
         stats = {
             "counts_per_expert": counts_per_expert.detach().cpu(),  # tensor [E]

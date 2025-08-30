@@ -15,6 +15,11 @@ class ConcatProjectFusion(nn.Module):
         img_emb: [B, D_img]
         returns: [B, D_model]
         """
+        # ensure both tensors are on the same device as the fusion layer
+        device = next(self.parameters()).device
+        txt_emb = txt_emb.to(device)
+        img_emb = img_emb.to(device)
+
         x = torch.cat([txt_emb, img_emb], dim=-1)
         x = self.proj(x)
         return self.ln(x)

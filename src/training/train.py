@@ -1,20 +1,20 @@
-import argparse, os, json, time, csv, math, random
+import argparse, os, json, time, csv, random
 from pathlib import Path
 from copy import deepcopy
 
 import torch
-import torch.nn as nn
 import torch.optim as optim
 import yaml
 import numpy as np
 from tqdm import tqdm
 
-from src.datasets.preprocess_image import build_dataloaders
-from src.model.jamba_moe import JambaMoEForCIFAR10
+from src.datasets.preprocess_image import build_dataloaders as build_img_loaders
+from src.datasets.preprocess_text import build_text_dataloaders
+from src.datasets.preprocess_video import build_video_dataloaders, count_video_classes
+from src.model.jamba_moe import JambaMoEClassifier
+
 
 # utils
-
-
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -24,16 +24,6 @@ def set_seed(seed: int):
 
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
-
-
-def save_yaml(obj, path: Path):
-    with open(path, "w") as f:
-        yaml.safe_dump(obj, f)
-
-
-def save_json(obj, path: Path):
-    with open(path, "w") as f:
-        json.dump(obj, f, indent=2)
 
 
 def write_csv_row(path: Path, header, row):
@@ -55,9 +45,7 @@ def deep_update(base: dict, override: dict) -> dict:
     return out
 
 
-# training loop
-
-
+# per-epoch loops
 def train_one_epoch(
     model,
     loader,
@@ -73,42 +61,37 @@ def train_one_epoch(
     step_count = 0
     total_loss = 0.0
 
-    # logs
     train_loss_csv = logs_dir / "train_loss.csv"
     routing_batch_path = logs_dir / "routing_batch.jsonl"
-
     autocast = torch.autocast if torch.cuda.is_available() else torch.cpu.amp.autocast
     dtype = torch.bfloat16 if use_bf16 and torch.cuda.is_available() else None
 
     optimizer.zero_grad(set_to_none=True)
     for bi, batch in enumerate(tqdm(loader, desc=f"Train epoch {epoch_idx}")):
-        pixel_values = batch["pixel_values"].to(device, non_blocking=True)
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
-        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-        labels = batch["labels"].to(device, non_blocking=True)
-
+        batch = {
+            k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
+            for k, v in batch.items()
+        }
         with (
             autocast(device_type="cuda", dtype=dtype)
             if dtype is not None
-            else torch.no_grad() if False else torch.enable_grad()
+            else torch.enable_grad()
         ):
             loss, outputs = model(
-                pixel_values=pixel_values,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
+                pixel_values=batch.get("pixel_values"),
+                video_frames=batch.get("video_frames"),
+                input_ids=batch.get("input_ids"),
+                attention_mask=batch.get("attention_mask"),
+                labels=batch.get("labels"),
             )
             loss = loss / grad_accum_steps
-
         loss.backward()
         if (bi + 1) % grad_accum_steps == 0:
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-        total_loss += loss.item()
+        total_loss += float(loss.item())
         step_count += 1
-
-        # per-batch logging
         if (bi + 1) % log_every == 0 or (bi + 1) == len(loader):
             avg_loss = total_loss / step_count
             write_csv_row(
@@ -117,7 +100,6 @@ def train_one_epoch(
                 row=[epoch_idx, bi + 1, avg_loss],
             )
 
-        # routing stats logging (per layer)
         for layer_idx, stats in enumerate(outputs["routing_logs"]):
             entry = {
                 "phase": "train",
@@ -127,7 +109,6 @@ def train_one_epoch(
                 "counts_per_expert": stats["counts_per_expert"].tolist(),
                 "balance_score": float(stats["balance_score"]),
                 "topk_entropy": float(stats["topk_entropy"]),
-                # kept_mask omitted for size
             }
             with open(routing_batch_path, "a") as f:
                 f.write(json.dumps(entry) + "\n")
@@ -140,35 +121,31 @@ def evaluate(model, loader, device, use_bf16, logs_dir, epoch_idx):
     model.eval()
     total_loss = 0.0
     steps = 0
-
     val_loss_csv = logs_dir / "val_loss.csv"
     routing_batch_path = logs_dir / "routing_batch.jsonl"
-
     autocast = torch.autocast if torch.cuda.is_available() else torch.cpu.amp.autocast
     dtype = torch.bfloat16 if use_bf16 and torch.cuda.is_available() else None
 
     for bi, batch in enumerate(tqdm(loader, desc=f"Valid epoch {epoch_idx}")):
-        pixel_values = batch["pixel_values"].to(device, non_blocking=True)
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
-        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-        labels = batch["labels"].to(device, non_blocking=True)
-
+        batch = {
+            k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
+            for k, v in batch.items()
+        }
         with (
             autocast(device_type="cuda", dtype=dtype)
             if dtype is not None
             else torch.no_grad()
         ):
             loss, outputs = model(
-                pixel_values=pixel_values,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
+                pixel_values=batch.get("pixel_values"),
+                video_frames=batch.get("video_frames"),
+                input_ids=batch.get("input_ids"),
+                attention_mask=batch.get("attention_mask"),
+                labels=batch.get("labels"),
             )
-
-        total_loss += loss.item()
+        total_loss += float(loss.item())
         steps += 1
 
-        # routing stats
         for layer_idx, stats in enumerate(outputs["routing_logs"]):
             entry = {
                 "phase": "val",
@@ -187,146 +164,137 @@ def evaluate(model, loader, device, use_bf16, logs_dir, epoch_idx):
     return avg_loss
 
 
+# task builders
+def build_task_loaders(cfg):
+    task = cfg["base"].get("task", "image_text_cifar10")
+    dcfg = cfg["data"]
+    txt_tok = cfg["encoders"]["text"].get("tokenizer_name", "ai21labs/Jamba-v0.1")
+
+    if task == "image_text_cifar10":
+        train_loader, val_loader, _ = build_img_loaders(
+            image_size=int(dcfg["image"].get("image_size", 224)),
+            tokenizer_name=txt_tok,
+            batch_size_train=int(cfg["base"].get("per_device_train_batch_size", 64)),
+            batch_size_eval=int(cfg["base"].get("per_device_eval_batch_size", 64)),
+            train_split=str(dcfg["image"].get("train_split", "train[:90%]")),
+            val_split=str(dcfg["image"].get("val_split", "train[90%:]")),
+            test_split="test",
+            num_workers=2,
+            text_from_labels=True,
+        )
+        num_classes = 10
+        modalities = ["text", "image"]
+
+    elif task == "text_agnews":
+        train_loader, val_loader, num_classes = build_text_dataloaders(
+            tokenizer_name=txt_tok,
+            batch_size_train=int(cfg["base"].get("per_device_train_batch_size", 64)),
+            batch_size_eval=int(cfg["base"].get("per_device_eval_batch_size", 64)),
+            dataset_name=str(dcfg["text"].get("dataset_name", "ag_news")),
+            train_split=str(dcfg["text"].get("train_split", "train[:2000]")),
+            val_split=str(dcfg["text"].get("val_split", "test[:1000]")),
+            max_length=int(dcfg["text"].get("max_length", 128)),
+            num_workers=2,
+        )
+        modalities = ["text"]
+
+    elif task == "video_folder":
+        train_loader, val_loader = build_video_dataloaders(
+            root=str(dcfg["video"].get("root", "data/mini_ucf")),
+            image_size=int(dcfg["video"].get("image_size", 224)),
+            num_frames=int(dcfg["video"].get("num_frames", 8)),
+            batch_size_train=int(dcfg["video"].get("batch_size_train", 4)),
+            batch_size_eval=int(dcfg["video"].get("batch_size_eval", 4)),
+            tokenizer_name=txt_tok,
+            max_text_len=int(dcfg["video"].get("max_text_len", 16)),
+            num_workers=2,
+        )
+        num_classes = count_video_classes(
+            str(dcfg["video"].get("root", "data/mini_ucf"))
+        )
+        modalities = ["text", "video"]
+    else:
+        raise ValueError(f"Unknown task: {task}")
+
+    return train_loader, val_loader, num_classes, modalities
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="training/config.yaml",
-        help="Path to YAML config (default: training/config.yaml)",
-    )
-    parser.add_argument(
-        "--preset",
-        type=str,
-        default="base",
-        help="Which preset block to use (base, ablation_small, ...)",
-    )
+    parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--preset", type=str, default="base")
     args = parser.parse_args()
-
-    # check if config file exists
-    if not os.path.exists(args.config):
-        raise FileNotFoundError(f"Config file not found: {args.config}")
 
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
 
     base_cfg = cfg.get("base", {})
-    data_cfg = cfg.get("data", {})
-    enc_cfg = cfg.get("encoders", {})
-    fusion_cfg = cfg.get("fusion", {})
-    moe_cfg = cfg.get("moe", {})
-
     if args.preset != "base":
         if args.preset not in cfg:
-            raise ValueError(f"Preset '{args.preset}' not found in YAML.")
-        preset_override = cfg[args.preset]
-        combined = {
-            "base": base_cfg,
-            "data": data_cfg,
-            "encoders": enc_cfg,
-            "fusion": fusion_cfg,
-            "moe": moe_cfg,
-        }
-        final = deep_update(
-            combined,
-            (
-                {"base": preset_override}
-                if "num_epochs" in preset_override or "output_dir" in preset_override
-                else {}
-            ),
-        )
-        for k in ["data", "encoders", "fusion", "moe"]:
-            if k in preset_override:
-                final[k] = deep_update(final[k], preset_override[k])
-        base_cfg, data_cfg, enc_cfg, fusion_cfg, moe_cfg = (
-            final["base"],
-            final["data"],
-            final["encoders"],
-            final["fusion"],
-            final["moe"],
-        )
+            raise ValueError(f"Preset '{args.preset}' not found.")
+        # allow ablation presets to override 'moe' etc.
+        for section in ["base", "data", "encoders", "fusion", "moe"]:
+            if section in cfg[args.preset]:
+                cfg[section] = deep_update(
+                    cfg.get(section, {}), cfg[args.preset][section]
+                )
 
-    seed = int(base_cfg.get("seed", 42))
+    seed = int(cfg["base"].get("seed", 42))
     set_seed(seed)
-
-    # device & precision
     device = "cuda" if torch.cuda.is_available() else "cpu"
     use_bf16 = (
-        bool(base_cfg.get("bf16", False))
+        bool(cfg["base"].get("bf16", False))
         and torch.cuda.is_available()
         and torch.cuda.is_bf16_supported()
     )
 
-    # run dir
+    # dirs
     ts = time.strftime("%Y%m%d-%H%M%S")
-    run_dir = Path(base_cfg.get("output_dir", "checkpoints/poc")) / ts
-    ensure_dir(run_dir)
+    run_dir = Path(cfg["base"].get("output_dir", "checkpoints/poc")) / ts
     logs_dir = run_dir / "logs"
-    ensure_dir(logs_dir)
     plots_dir = run_dir / "plots"
+    ensure_dir(run_dir)
+    ensure_dir(logs_dir)
     ensure_dir(plots_dir)
 
-    # save resolved config
-    resolved_cfg = {
-        "seed": seed,
-        "device": device,
-        "bf16": use_bf16,
-        "base": base_cfg,
-        "data": data_cfg,
-        "encoders": enc_cfg,
-        "fusion": fusion_cfg,
-        "moe": moe_cfg,
-    }
-    save_yaml(resolved_cfg, run_dir / "resolved_config.yaml")
-
     # data
-    train_loader, val_loader, test_loader = build_dataloaders(
-        image_size=int(data_cfg.get("image_size", 224)),
-        tokenizer_name=str(
-            enc_cfg.get("text", {}).get("tokenizer_name", "ai21labs/Jamba-v0.1")
-        ),
-        batch_size_train=int(base_cfg.get("per_device_train_batch_size", 64)),
-        batch_size_eval=int(base_cfg.get("per_device_eval_batch_size", 64)),
-        train_split=str(data_cfg.get("train_split", "train[:90%]")),
-        val_split=str(data_cfg.get("val_split", "train[90%:]")),
-        test_split=str(data_cfg.get("test_split", "test")),
-        num_workers=2,
-        text_from_labels=bool(data_cfg.get("text_from_labels", True)),
-    )
+    train_loader, val_loader, num_classes, modalities = build_task_loaders(cfg)
 
     # model
-    model = JambaMoEForCIFAR10(
-        num_classes=10,
-        txt_hidden=int(enc_cfg.get("text", {}).get("hidden_size", 2048)),
-        img_hidden=int(enc_cfg.get("image", {}).get("proj_out", 2048)),
-        model_dim=int(fusion_cfg.get("hidden_size", 2048)),
-        ffn_dim=int(moe_cfg.get("ffn_dim", 4096)),
-        num_experts=int(moe_cfg.get("num_experts", 4)),
-        num_layers=int(moe_cfg.get("num_layers", 1)),
-        capacity_factor=float(moe_cfg.get("capacity_factor", 1.25)),
-        tokenizer_name=str(
-            enc_cfg.get("text", {}).get("tokenizer_name", "ai21labs/Jamba-v0.1")
-        ),
+    enc = cfg["encoders"]
+    fusion = cfg["fusion"]
+    moe = cfg["moe"]
+    model = JambaMoEClassifier(
+        num_classes=num_classes,
+        active_modalities=modalities,
+        txt_hidden=int(enc["text"].get("hidden_size", 1024)),
+        img_hidden=int(enc["image"].get("proj_out", 1024)),
+        vid_hidden=int(enc["video"].get("proj_out", 1024)),
+        model_dim=int(fusion.get("hidden_size", 1024)),
+        ffn_dim=int(moe.get("ffn_dim", 2048)),
+        num_experts=int(moe.get("num_experts", 4)),
+        num_layers=int(moe.get("num_layers", 1)),
+        capacity_factor=float(moe.get("capacity_factor", 1.25)),
+        tokenizer_name=str(enc["text"].get("tokenizer_name", "ai21labs/Jamba-v0.1")),
+        freeze_encoders=True,
     ).to(device)
-
-    # freeze encoders for sanity
     model.freeze_encoders()
 
-    # optimizer (only trainable params)
+    # optimizer
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optim.AdamW(
         params,
-        lr=float(base_cfg.get("learning_rate", 5e-4)),
-        weight_decay=float(base_cfg.get("weight_decay", 0.0)),
+        lr=float(cfg["base"].get("learning_rate", 5e-4)),
+        weight_decay=float(cfg["base"].get("weight_decay", 0.0)),
     )
 
-    # train loop
-    num_epochs = int(base_cfg.get("num_epochs", 2))
-    log_every = int(base_cfg.get("log_every", 25))
-    grad_accum_steps = int(base_cfg.get("grad_accum_steps", 1))
+    # train
+    num_epochs = int(cfg["base"].get("num_epochs", 2))
+    log_every = int(cfg["base"].get("log_every", 25))
+    grad_accum_steps = int(cfg["base"].get("grad_accum_steps", 1))
 
     for epoch in range(1, num_epochs + 1):
-        train_loss = train_one_epoch(
+        tr = train_one_epoch(
             model,
             train_loader,
             optimizer,
@@ -337,23 +305,22 @@ def main():
             epoch,
             grad_accum_steps,
         )
-        val_loss = evaluate(model, val_loader, device, use_bf16, logs_dir, epoch)
+        va = evaluate(model, val_loader, device, use_bf16, logs_dir, epoch)
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "train_loss": tr,
+                "val_loss": va,
+            },
+            run_dir / f"checkpoint_epoch{epoch}.pt",
+        )
 
-        # save checkpoint
-        ckpt = {
-            "epoch": epoch,
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-        }
-        torch.save(ckpt, run_dir / f"checkpoint_epoch{epoch}.pt")
-
-    # also save a last pointer
-    with open(run_dir / "last_run.txt", "w") as f:
-        f.write(str(run_dir))
-
-    print(f"Training done. Run dir: {run_dir}")
+    (run_dir / "last_run.txt").write_text(str(run_dir))
+    with open(run_dir / "resolved_config.yaml", "w") as f:
+        yaml.safe_dump(cfg, f)
+    print(f"Done. Run dir: {run_dir}")
 
 
 if __name__ == "__main__":
