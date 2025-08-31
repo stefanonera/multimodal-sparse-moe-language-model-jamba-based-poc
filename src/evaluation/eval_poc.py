@@ -10,6 +10,8 @@ from .metrics import (
     plot_expert_usage_bars,
     plot_counts_heatmap,
     plot_balance_entropy,
+    plot_expert_usage_epochs_overview,
+    plot_expert_heatmap_epochs_overview,
 )
 
 
@@ -75,6 +77,39 @@ def main():
             phase=phase,
             out_path=plots_dir / f"heatmap_epoch{epoch}_layer{layer}_{phase}.png",
         )
+
+    # 2c. NEW: Full overview plots across epochs
+    # Expert usage evolution across epochs
+    plot_expert_usage_epochs_overview(
+        routing_batch=routing_batch,
+        num_experts=num_experts,
+        num_layers=num_layers,
+        out_path=plots_dir / "expert_usage_epochs_overview_train.png",
+        phase="train",
+    )
+    plot_expert_usage_epochs_overview(
+        routing_batch=routing_batch,
+        num_experts=num_experts,
+        num_layers=num_layers,
+        out_path=plots_dir / "expert_usage_epochs_overview_val.png",
+        phase="val",
+    )
+
+    # Expert heatmap evolution across epochs
+    plot_expert_heatmap_epochs_overview(
+        routing_batch=routing_batch,
+        num_experts=num_experts,
+        num_layers=num_layers,
+        out_path=plots_dir / "expert_heatmap_epochs_overview_train.png",
+        phase="train",
+    )
+    plot_expert_heatmap_epochs_overview(
+        routing_batch=routing_batch,
+        num_experts=num_experts,
+        num_layers=num_layers,
+        out_path=plots_dir / "expert_heatmap_epochs_overview_val.png",
+        phase="val",
+    )
 
     print(f"Eval complete. Plots in {plots_dir}")
 

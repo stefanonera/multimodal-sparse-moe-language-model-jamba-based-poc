@@ -10,6 +10,7 @@ base: &base
   bf16: true
   log_every: 25
   grad_accum_steps: 4
+  save_checkpoints: false  # by default, don't save .pt files to save storage
 
 data:
   image:

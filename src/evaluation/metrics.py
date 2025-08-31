@@ -6,6 +6,8 @@ from collections import defaultdict
 
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
 
 
 def load_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -181,4 +183,131 @@ def plot_counts_heatmap(
     plt.title(f"Expert usage heatmap (epoch {epoch}, layer {layer}, {phase})")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, bbox_inches="tight")
+    plt.close()
+
+
+def plot_expert_usage_epochs_overview(
+    routing_batch, num_experts, num_layers, out_path, phase="train"
+):
+    """
+    Plot expert usage evolution across epochs for all layers in a single overview plot.
+    Creates subplots for each layer showing expert usage trends over epochs.
+    """
+    # Aggregate expert counts by epoch and layer
+    epoch_layer_counts = {}
+    for entry in routing_batch:
+        if entry["phase"] != phase:
+            continue
+        epoch = entry["epoch"]
+        layer = entry["layer"]
+        counts = np.array(entry["counts_per_expert"])
+
+        key = (epoch, layer)
+        if key not in epoch_layer_counts:
+            epoch_layer_counts[key] = []
+        epoch_layer_counts[key].append(counts)
+
+    # Average counts per epoch-layer
+    epoch_layer_avg = {}
+    for (epoch, layer), count_list in epoch_layer_counts.items():
+        epoch_layer_avg[(epoch, layer)] = np.mean(count_list, axis=0)
+
+    # Create subplots for each layer
+    fig, axes = plt.subplots(num_layers, 1, figsize=(12, 4 * num_layers))
+    if num_layers == 1:
+        axes = [axes]
+
+    epochs = sorted(set(epoch for epoch, _ in epoch_layer_avg.keys()))
+
+    for layer_idx in range(num_layers):
+        ax = axes[layer_idx]
+
+        # Prepare data for this layer
+        layer_data = np.zeros((len(epochs), num_experts))
+        for i, epoch in enumerate(epochs):
+            if (epoch, layer_idx) in epoch_layer_avg:
+                layer_data[i] = epoch_layer_avg[(epoch, layer_idx)]
+
+        # Plot expert usage trends
+        for expert_idx in range(num_experts):
+            ax.plot(
+                epochs,
+                layer_data[:, expert_idx],
+                marker="o",
+                label=f"Expert {expert_idx}",
+                linewidth=2,
+            )
+
+        ax.set_title(f"Expert Usage Evolution - Layer {layer_idx} ({phase.upper()})")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Average Expert Usage")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def plot_expert_heatmap_epochs_overview(
+    routing_batch, num_experts, num_layers, out_path, phase="train"
+):
+    """
+    Plot expert usage heatmaps across epochs for all layers in a single overview plot.
+    Creates a grid showing how expert usage patterns change over epochs.
+    """
+    # Aggregate expert counts by epoch and layer
+    epoch_layer_counts = {}
+    for entry in routing_batch:
+        if entry["phase"] != phase:
+            continue
+        epoch = entry["epoch"]
+        layer = entry["layer"]
+        counts = np.array(entry["counts_per_expert"])
+
+        key = (epoch, layer)
+        if key not in epoch_layer_counts:
+            epoch_layer_counts[key] = []
+        epoch_layer_counts[key].append(counts)
+
+    # Average counts per epoch-layer
+    epoch_layer_avg = {}
+    for (epoch, layer), count_list in epoch_layer_counts.items():
+        epoch_layer_avg[(epoch, layer)] = np.mean(count_list, axis=0)
+
+    epochs = sorted(set(epoch for epoch, _ in epoch_layer_avg.keys()))
+
+    # Create a large heatmap: rows=layers, cols=epochs, each cell shows expert distribution
+    fig, axes = plt.subplots(
+        num_layers, len(epochs), figsize=(3 * len(epochs), 3 * num_layers)
+    )
+    if num_layers == 1 and len(epochs) == 1:
+        axes = [[axes]]
+    elif num_layers == 1:
+        axes = [axes]
+    elif len(epochs) == 1:
+        axes = [[ax] for ax in axes]
+
+    for layer_idx in range(num_layers):
+        for epoch_idx, epoch in enumerate(epochs):
+            ax = axes[layer_idx][epoch_idx]
+
+            if (epoch, layer_idx) in epoch_layer_avg:
+                data = epoch_layer_avg[(epoch, layer_idx)].reshape(1, -1)
+            else:
+                data = np.zeros((1, num_experts))
+
+            im = ax.imshow(data, cmap="viridis", aspect="auto")
+            ax.set_title(f"L{layer_idx} E{epoch}")
+            ax.set_xticks(range(num_experts))
+            ax.set_xticklabels([f"E{i}" for i in range(num_experts)])
+            ax.set_yticks([])
+
+            # Add colorbar for each subplot
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    # Add overall title
+    fig.suptitle(f"Expert Usage Heatmap Evolution - {phase.upper()}", fontsize=16)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()

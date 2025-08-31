@@ -223,6 +223,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--preset", type=str, default="base")
+    parser.add_argument(
+        "--save-checkpoints",
+        action="store_true",
+        help="Save .pt checkpoint files (disabled by default to save storage)",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
@@ -292,6 +297,9 @@ def main():
     num_epochs = int(cfg["base"].get("num_epochs", 2))
     log_every = int(cfg["base"].get("log_every", 25))
     grad_accum_steps = int(cfg["base"].get("grad_accum_steps", 1))
+    save_checkpoints = args.save_checkpoints or bool(
+        cfg["base"].get("save_checkpoints", False)
+    )
 
     for epoch in range(1, num_epochs + 1):
         tr = train_one_epoch(
@@ -306,21 +314,28 @@ def main():
             grad_accum_steps,
         )
         va = evaluate(model, val_loader, device, use_bf16, logs_dir, epoch)
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state": model.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "train_loss": tr,
-                "val_loss": va,
-            },
-            run_dir / f"checkpoint_epoch{epoch}.pt",
-        )
+
+        # Only save checkpoints if explicitly requested
+        if save_checkpoints:
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "train_loss": tr,
+                    "val_loss": va,
+                },
+                run_dir / f"checkpoint_epoch{epoch}.pt",
+            )
 
     (run_dir / "last_run.txt").write_text(str(run_dir))
     with open(run_dir / "resolved_config.yaml", "w") as f:
         yaml.safe_dump(cfg, f)
-    print(f"Done. Run dir: {run_dir}")
+
+    if save_checkpoints:
+        print(f"Done. Run dir: {run_dir} (with checkpoints)")
+    else:
+        print(f"Done. Run dir: {run_dir} (no checkpoints saved)")
 
 
 if __name__ == "__main__":

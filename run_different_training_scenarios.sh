@@ -4,6 +4,15 @@ set -euo pipefail
 CFG_PATH="src/training/config.yaml"
 PYTHON=${PYTHON:-python}
 
+# Parse command line arguments
+SAVE_CHECKPOINTS=""
+if [[ "${1:-}" == "--save-checkpoints" ]]; then
+    SAVE_CHECKPOINTS="--save-checkpoints"
+    echo "Checkpoint saving enabled"
+else
+    echo "Checkpoint saving disabled (use --save-checkpoints to enable)"
+fi
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p "$ROOT_DIR/checkpoints"
 : > "$ROOT_DIR/checkpoints/run_index.txt"
@@ -55,13 +64,13 @@ summarize_run() {
   local TRAIN_CSV="$RUN/logs/train_loss.csv"
   local VAL_CSV="$RUN/logs/val_loss.csv"
 
-  # pull last values safely
+  # pull last values safely and strip all whitespace/newlines
   local TRAIN_LAST=""; local VAL_LAST=""
   if [[ -f "$TRAIN_CSV" && -s "$TRAIN_CSV" ]]; then
-    TRAIN_LAST="$(tail -n 1 "$TRAIN_CSV" | awk -F, '{if(NF>=3) print $3; else print ""}')"
+    TRAIN_LAST="$(tail -n 1 "$TRAIN_CSV" | awk -F, '{if(NF>=3) print $3; else print ""}' | tr -d '\n\r' | xargs)"
   fi
   if [[ -f "$VAL_CSV" && -s "$VAL_CSV" ]]; then
-    VAL_LAST="$(tail -n 1 "$VAL_CSV" | awk -F, '{if(NF>=2) print $2; else print ""}')"
+    VAL_LAST="$(tail -n 1 "$VAL_CSV" | awk -F, '{if(NF>=2) print $2; else print ""}' | tr -d '\n\r' | xargs)"
   fi
 
   echo "$TAG -> $RUN" | tee -a "$ROOT_DIR/checkpoints/run_index.txt" >/dev/null
@@ -76,7 +85,7 @@ train_and_eval() {
   edit_cfg "$CFG_PATH" "$TMP_CFG" "$TASK" "$ODIR/$LABEL" "$LAYERS" "$EXP" "$CAP"
 
 echo "→ Training [$TASK/$LABEL] ..."
-    $PYTHON -m src.training.train --config "$TMP_CFG" --preset base
+    $PYTHON -m src.training.train --config "$TMP_CFG" --preset base $SAVE_CHECKPOINTS
 
     local RUN_DIR; RUN_DIR="$(latest_run_dir "$ODIR/$LABEL")"
     echo "→ Evaluating [$TASK/$LABEL] at: $RUN_DIR"
@@ -121,3 +130,8 @@ done
 echo "-------------------------------------------------------------------"
 echo "Completed. Index at checkpoints/run_index.txt"
 echo "Summary CSV at $SUMMARY_CSV"
+if [[ -n "$SAVE_CHECKPOINTS" ]]; then
+    echo "Checkpoints were saved to respective run directories"
+else
+    echo "No checkpoints saved (use --save-checkpoints to enable)"
+fi
